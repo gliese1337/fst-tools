@@ -1,0 +1,27 @@
+{
+  "name": "fst-tools",
+  "version": "1.0.0",
+  "description": "Algorithms for manipulating finite-state transducers.",
+  "main": "bin/index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "fst",
+    "fsm",
+    "finite-state"
+  ],
+  "author": "Logan R. Kearsley",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gliese1337/fst-tools.git"
+  },
+  "bugs": {
+    "url": "https://github.com/gliese1337/fst-tools/issues"
+  },
+  "homepage": "https://github.com/gliese1337/fst-tools#readme",
+  "devDependencies": {
+    "typescript": "^4.1.2"
+  }
+}
