@@ -1,9 +1,11 @@
 export const EPSILON = Symbol('e');
 
+type Token = string | Symbol;
+
 class Edge {
   constructor(
-    public input: string | Symbol,
-    public output: string | Symbol,
+    public input: Token,
+    public output: Token,
     public source: number,
     public target: number,
   ) {}
@@ -17,11 +19,10 @@ class State {
   ) {}
 }
 
-
 // Get all of the states that can be reached through
 // epsilon transitions, with their associated outputs.
-function * epsilon_closure(s: State, fst: _FST, prefix: (string|Symbol)[], outprop: "input" | "output") {
-  const pair: [State, (string|Symbol)[]] = [s, prefix];
+function * epsilon_closure(s: State, fst: FST, prefix: Token[], outprop: "input" | "output") {
+  const pair: [State, Token[]] = [s, prefix];
   const stack = [pair];
   const seen = new Set<State>([s]);
 
@@ -45,7 +46,7 @@ function * epsilon_closure(s: State, fst: _FST, prefix: (string|Symbol)[], outpr
   }
 }
 
-function * double_epsilon_closure(s: State, fst: _FST) {
+function * double_epsilon_closure(s: State, fst: FST) {
   const stack = [s];
   const seen = new Set<State>([s]);
 
@@ -67,9 +68,9 @@ function * double_epsilon_closure(s: State, fst: _FST) {
 }
 
 function extend_outputs(
-  fst: _FST, target: number, prefix: (string|Symbol)[], outprop: "input" | "output",
-  outputs: (string|Symbol)[][],
-  states: [State, (string|Symbol)[]][],
+  fst: FST, target: number, prefix: Token[], outprop: "input" | "output",
+  outputs: Token[][],
+  states: [State, Token[]][],
 ) {
   const closure = epsilon_closure(fst.states[target], fst, prefix, outprop);
   for (const pair of closure) {
@@ -86,20 +87,20 @@ function extend_outputs(
 
 export interface Executor {
   outputs: string[][];
-  next(i: string|Symbol): null | Executor;
+  next(i: Token): null | Executor;
 }
 
-class Recognizer implements Executor {
+class _Executor implements Executor {
   
   constructor(
     private inprop: "input" | "output",
     private outprop: "input" | "output",
-    private fst: _FST,
+    private fst: FST,
     private states: [State, string[]][],
     public outputs: string[][],
   ) {}
 
-  next(i: string|Symbol) {
+  next(i: Token) {
     const { fst, states, inprop, outprop } = this;
     const nstates: [State, string[]][] = [];
     const outputs: string[][] = [];
@@ -113,57 +114,53 @@ class Recognizer implements Executor {
       }
     }
     if (nstates.length === 0) return null;
-    return new Recognizer(inprop, outprop, fst, nstates, outputs);
+    return new _Executor(inprop, outprop, fst, nstates, outputs);
   }
 }
 
-export class Acceptor {
+export interface Recognizer {
+  next(i: Token, o: Token): Recognizer | null;
+}
+
+class _Recognizer implements Recognizer {
   constructor(
-    private fst: _FST,
+    private fst: FST,
     private states: State[],
+    public accepts: boolean,
   ) {}
 
-  next(i: string|Symbol, o: string|Symbol) {
+  next(i: Token, o = i) {
     const { fst, states } = this;
     const nstates: State[] = [];
+    let accepts = false;
     for (const state of states) {
       for (const { input, output, target } of state.edges) {
         if (input !== i || output !== o) continue;
-        nstates.push(fst.states[target]);
+        const state = fst.states[target];
+        accepts = accepts || state.accepts;
+        nstates.push(state);
       }
     }
     if (nstates.length === 0) return null;
-    return new Acceptor(fst, nstates);
+    return new _Recognizer(fst, nstates, accepts);
   }
 }
 
-export interface FST {
-  clone(): FST;
-  union(g: FST): FST;
-  compose(g: FST): FST;
-  concat(g: FST): FST;
-  project(dir: "input" | "output"): FST;
-  upper(): FST;
-  lower(): FST;
-  plus(): FST;
-  star(): FST;
-  determinize(): FST;
-  generate(): Executor;
-  analyze(): Executor;
-}
-
-class _FST implements FST {
+export class FST {
   // https://www.aclweb.org/anthology/C88-2113.pdf
+
+  private is_plus = false;
+  private is_determined = false;
   constructor(public states: State[], public start = 0) {}
   
   clone() {
     const nstates = this.states.map(s => new State(
       s.n, s.accepts, s.edges.map(e => new Edge(e.input, e.output, e.source, e.target)),
     ));
-    return new _FST(nstates, this.start);
+    return new FST(nstates, this.start) as FST;
   }
   
-  union(g: _FST) {
+  union(g: FST) {
     const f = this.clone();
     const l = f.states.length;
     const l1 = l - 1;
@@ -193,6 +190,9 @@ class _FST implements FST {
     return f;
   }
 
+  // Get all edges in the transducer, augmented with
+  // epsilon self-loops on all states to simplify
+  // matching in the composition algorithm
   private all_edges_with_loops(){
     const edges: Edge[] = [];
     for (const state of this.states) {
@@ -210,7 +210,7 @@ class _FST implements FST {
     return edges;
   }
 
-  compose(g: _FST) {
+  compose(g: FST) {
     // https://storage.googleapis.com/pub-tools-public-publication-data/pdf/35539.pdf
     const f = this;
     const A = f.states.length;
@@ -287,7 +287,6 @@ class _FST implements FST {
       }
     }
 
-
     // Calculate which new states should be accepting states
     for (let i = 0, j = 0; j < A; j++) {
       if (!f.states[j].accepts) i += B;
@@ -300,37 +299,68 @@ class _FST implements FST {
     }
 
     // TODO: Minimize 
-    return new _FST(states, 0);
+    return new FST(states, 0);
   }
 
-  concat(g: _FST) {
+  concat(g: FST) {
     const fst = this.clone();
+    const gstart = g.start;
 
-    // Step 1: the states from each input FST
+    // g's start state may end up stranded, if
+    // it is not recursively accessible in g.
+    // So, before copying it, check if we need to.
+    let stranded = false;
+    find_gstart: {
+      const { states } = g;
+      const stack = [gstart];
+      const seen = new Set();
+      while (stack.length > 0) {
+        const { edges } = states[stack.pop() as number];
+        for (const { target } of edges) {
+          if (target === gstart) break find_gstart;
+          if (seen.has(target)) continue;
+          seen.add(target);
+          stack.push(target);
+        }
+      }
+      stranded = true;
+    }
+
+    // Cache f's accepting states, because these
+    // will be used to link to g's copied states.
     const { states } = fst;
     const accepting = states.filter(s => s.accepts);
+
+    // Copy g's states into the new FST state list.
     const offset = states.length;
-    for (const state of g.states) {
-      const idx = state.n + offset
+    for (const { n, accepts, edges } of g.states) {
+      if (stranded && n === gstart) continue;
+      const idx = n + offset - (stranded && n > gstart ? 1 : 0);
       states.push(new State(
         idx,
-        state.accepts,
-        state.edges.map(e =>
-          new Edge(e.input, e.output, idx, e.target + offset)
+        accepts,
+        edges.map(e =>
+          new Edge(
+            e.input, e.output, idx,
+            e.target + offset - (stranded && e.target > gstart ? 1 : 0),
+          )
         ),
       ));
     }
 
-    // Step 2: add epsilon transitions from the old
-    // accepting states of the first FST to the old
-    // start state of the second FST. We preserve the
-    // start state of the first FST and the accepting
-    // states of the second FST.
-    // TODO: Collapse states instead of adding epsilons
-    const target = g.start + offset;
+    // Add the starting transitions of g to the old
+    // accepting states of f. We preserve the start
+    // state of f and the accepting states of g.
+    const transitions = g.states[gstart].edges;
     for (const state of accepting) {
       state.accepts = false;
-      state.edges.push(new Edge(EPSILON, EPSILON, state.n, target));
+      const { n, edges } = state;
+      for (const { input, output, target } of transitions) {
+        edges.push(new Edge(
+          input, output, n,
+          target + offset - (stranded && target > gstart ? 1 : 0),
+        ));
+      }
     }
 
     // TODO: minimize
@@ -352,8 +382,7 @@ class _FST implements FST {
     });
 
     // TODO: Minimize
-    return new _FST(nstates, this.start);
-  
+    return new FST(nstates, this.start);  
   }
 
   // Output projection
@@ -365,22 +394,38 @@ class _FST implements FST {
   // Kleene Plus iteration
   // For every non-starting accepting state,
   // add an epsilon transition back to the start.
+  // This is equivalent to copying the start
+  // state's transitions onto all accepting states.
   plus() {
+    if (this.is_plus) return this;
     const fst = this.clone();
     const start_n = fst.start;
     const start_s = fst.states[start_n];
-    for (const s of fst.states) {
-      if (!s.accepts || s === start_s) continue;
-      const back = s.edges.find(e =>
+    const start_edges = start_s.edges;
+    for (const { n, accepts, edges} of fst.states) {
+      if (!accepts || n === start_n) continue;
+      // if there is an existing epsilon transition
+      // to the start, remove it as redundant.
+      const back = edges.findIndex(e =>
         e.target === start_n &&
         e.input === EPSILON &&
         e.output === EPSILON
       );
-      // TODO: Collapse states instead of adding epsilons.
-      if (!back) s.edges.push(new Edge(EPSILON, EPSILON, s.n, start_n));
+      if (back > -1) edges.splice(back, 1);
+
+      // Copy edges without duplication
+      for (const { input, output, target } of start_edges) {
+        if (edges.findIndex(e =>
+          e.target === target &&
+          e.input === input &&
+          e.output === output
+        ) > -1) continue;
+        edges.push(new Edge(input, output, n, target));
+      }
     }
     
     // TODO: Minimize
+    fst.is_plus = true;
     return fst;
   }
 
@@ -389,30 +434,67 @@ class _FST implements FST {
   // add an epsilon transition back to the start,
   // and make the start state an accepting state.
   star() {
+    if (this.is_plus) {
+      if (this.states[this.start].accepts) return this;
+      const fst = this.clone();
+      fst.is_plus = true;
+      fst.states[fst.start].accepts = true;
+      return fst;
+    }
+
     const fst = this.plus();
     fst.states[fst.start].accepts = true;
 
-    // TODO: Minimize
     return fst;
   }
 
   determinize() {
+    if (this.is_determined) return this;
+
+    // Use the powerset construction, treating the FST
+    // as an NFA in which i/o pairs are treated as single
+    // symbols, and only FST double-epsilons are mapped
+    // to NFA epsilons.
+
+    // The other, more common, source of non-determinism
+    // is having multiple transitions to different states
+    // with the same transition symbols.
+
+    const hash = (s: Set<State>) => [...s]
+      .map(({ n }) => n)
+      .sort((a, b) => a - b)
+      .join(' ');
+
     const states: State[] = [];
-    const stack: [Set<State>, number][] = [
-      [new Set(double_epsilon_closure(this.states[this.start], this)), 0]
-    ];
+    const init_set = new Set(double_epsilon_closure(this.states[this.start], this));
+
+    const seen_sets = new Map([[hash(init_set), 0]]);
+    const stack: [Set<State>, number][] = [[init_set, 0]];
+    
     let i = 0;
     while (stack.length > 0) {
+      // Get a set of states from the stack, find all of its
+      // outgoing edges, create new sets from the targets of
+      // edges with common labels, and then create a new state
+      // with the collected edges of this set.
       const [substates, n] = stack.pop() as [Set<State>, number];
-      const paths = new Map<string|Symbol,Map<string|Symbol,Set<State>>>();
-      let any = false;
+
+      // Our new state will accept if any of its component states accepted.
+      let any_accept = false;
+
+      // This map-of-maps lets us accumulate states that are
+      // reached by edges with common input->output labels.
+      const paths = new Map<Token,Map<Token,Set<State>>>();
+
       for (const { edges, accepts } of substates) {
-        any = any || accepts;
+        any_accept = any_accept || accepts;
         for (const { input, output, target } of edges) {
-          // double epsilons are taken care of when calculating closures.
+          // Double epsilons are taken care of when calculating closures.
+          // These aren't outgoing edges, but rather make their target
+          // states already part of the current set.
           if (input === EPSILON && output === EPSILON) continue;
 
-          const m = paths.get(input) ?? new Map<string|Symbol,Set<State>>();
+          const m = paths.get(input) ?? new Map<Token,Set<State>>();
           const s = m.get(output) ?? new Set<State>();
           const targets = double_epsilon_closure(this.states[target], this);
           for (const state of targets) s.add(state);
@@ -421,41 +503,55 @@ class _FST implements FST {
         }
       }
 
+      // Now we look at each of the sets of states that
+      // are reachable from the current set, assign them
+      // new state numbers if they haven't been seen
+      // before, and create edges pointing to them for
+      // our new combined state.
       const edges: Edge[] = [];
       for (const [input, m] of paths.entries()) {
         for (const [output, s] of m.entries()) {
-          stack.push([s, i]);
-          edges.push(new Edge(input, output, n, i));
-          i++;
+          const h = hash(s);
+          const t = seen_sets.get(h);
+          if (typeof t === 'number') {
+            edges.push(new Edge(input, output, n, t));
+          } else {
+            stack.push([s, i]);
+            edges.push(new Edge(input, output, n, i));
+            seen_sets.set(h, i);
+            i++;
+          }
         }
       }
 
-      states[n] = new State(n, any, edges);
+      // Can't use "push" because states may be constructed out-of-order.
+      states[n] = new State(n, any_accept, edges);
     }
 
-    return new _FST(states, 0);
+    const fst = new FST(states, 0);
+    fst.is_plus = this.is_plus;
+    fst.is_determined = true;
+    return true;
   }
 
-  generate(): Executor {
+  private execute(
+    inprop: "input" | "output",
+    outprop: "input" | "output",
+  ): Executor {
     const states: [State, string[]][] = [];
     const outputs: string[][] = [];
-    extend_outputs(this, this.start, [], "output", outputs, states);
-    return new Recognizer(
-      "input", "output", this, states, outputs,
+    extend_outputs(this, this.start, [], outprop, outputs, states);
+    return new _Executor(
+      inprop, outprop, this, states, outputs,
     );
   }
 
-  analyze(): Executor {
-    const states: [State, string[]][] = [];
-    const outputs: string[][] = [];
-    extend_outputs(this, this.start, [], "input", outputs, states);
-    return new Recognizer(
-      "output", "input", this, states, outputs,
-    );
-  }
+  generate() { return this.execute("input", "output"); }
+  analyze() { return this.execute("output", "input"); }
 
-  accept(): Acceptor {
-    return new Acceptor(this, [this.states[this.start]]);
+  recognize(): Recognizer {
+    const start = this.states[this.start];
+    return new _Recognizer(this, [start], start.accepts);
   }
 
   toString() {
@@ -467,16 +563,22 @@ class _FST implements FST {
       }`)
     ).join('\n');
   }
-}
 
-export const FST = {
-  union(f: FST, g: FST) { return f.union(g); },
-  compose(f: FST, g: FST){ return f.compose(g); },
-  concat(f: FST, g: FST){ return f.concat(g); },
-  from_pairs(pairs: [string | Symbol, string | Symbol][]) {
-    const states = pairs.map(([i,o], n) =>
-      new State(n, false, [new Edge(i, o, n, n + 1)]));
-    states.push(new State(states.length, true, []));
-    return new _FST(states, 0);
+  static union(f: FST, g: FST) { return f.union(g); }
+  static compose(f: FST, g: FST){ return f.compose(g); }
+  static concat(f: FST, g: FST){ return f.concat(g); }
+
+  static from_pairs(pairs: Iterable<[Token, Token]>) {
+    const states = [];
+    let n = 0;
+    for (const [i, o] of pairs) {
+      if (i === EPSILON && o === EPSILON) continue;
+      states.push(new State(n, false, [new Edge(i, o, n, n + 1)]));
+      n++;
+    }
+    states.push(new State(n, true, []));
+    const fst = new FST(states, 0);
+    fst.is_determined = true;
+    return fst;
   }
 }
