@@ -146,11 +146,139 @@ class _Recognizer implements Recognizer {
   }
 }
 
+function t2s(t: Token) {
+  return typeof t === 'symbol' ? '`' + t.description : "'" + t;
+}
+
+function mutate_total(f: FST) {
+  const { states } = f;
+
+  // Calculate the implicit alphabet
+  const labels = states.flatMap(({ edges }) =>
+    edges.map(({ input, output }) => [input, output])
+         .filter(([i, o]) => i !== EPSILON && o !== EPSILON)
+  ).sort(([a, b], [c, d]) => {
+    const cmp = t2s(a).localeCompare(t2s(c));
+    return cmp === 0 ? t2s(b).localeCompare(t2s(d)) : cmp;
+  });
+  const l = labels.length;
+  let last = labels[0];
+  let j = 1;
+  for (let i = 1; i < l; i++) {
+    const pair = labels[i];
+    if (pair[0] !== last[0] || pair[1] !== last[1]) {
+      labels[j++] = pair;
+    }
+    last = pair;
+  }
+  labels.length = j;
+
+  // Ensure all states have transitions for all possible labels.
+  const newn = states.length;
+  let need_new = false;
+  for (const s of states) {
+    const { n, edges } = s;
+    edges.sort(({ input: a, output: b }, { input: c, output: d }) => {
+      const cmp = t2s(a).localeCompare(t2s(c));
+      return cmp === 0 ? t2s(b).localeCompare(t2s(d)) : cmp;
+    });
+    
+    const nedges = [];
+    for (let i = 0, k = 0; i < j; i++) {
+      const pair = labels[i];
+      const edge = edges[k];
+      if (edge && pair[0] == edge.input && pair[1] == edge.output) {
+        nedges.push(edge);
+        k++;
+      } else {
+        nedges.push(new Edge(pair[0], pair[1], n, newn));
+        need_new = true;
+      }
+    }
+  }
+
+  // If we had to add new transitions,
+  // add the new state that accepts them.
+  if (need_new) {
+    states.push(new State(newn, false,
+      labels.map(([i, o]) => new Edge(i, o, newn, newn))
+    ));
+  }
+}
+
+function mutate_union(f: FST, ...gs: FST[]) {
+  const fstates = f.states;
+  for (const g of gs) {
+    const l = fstates.length;
+    const l1 = l - 1;
+    for (const s of g.states) {
+      if (s.n === g.start) {
+        // Combine starting states
+        const { edges } = f.states[f.start];
+        for (const e of s.edges) {
+          const target = e.target;
+          const ntarget = target == g.start ? f.start :
+                          target + (target < g.start ? l : l1);
+          edges.push(new Edge(e.input, e.output, f.start, ntarget));
+        }
+      } else {
+        // Append non-starting states, and fix up state indices
+        const n = f.states.length;
+        const edges = s.edges.map(e => {
+          const target = e.target;
+          const ntarget = target == g.start ? f.start :
+                          target + (target < g.start ? l : l1);
+          return new Edge(e.input, e.output, n, ntarget);
+        });
+        fstates.push(new State(n, s.accepts, edges));
+      }
+    }
+  }
+}
+
+function trace(f: FST) {
+  // Trace from the start state to find all
+  // accessible states, and keep track of the
+  // ones that accept, and of backlinks.
+  const back = new Map<number, Set<number>>();
+  const useful = new Map<number, number>();
+  const stack = [f.start];
+  let nid = 0;
+  while (stack.length > 0) {
+    const id = stack.pop() as number;
+    const { edges, accepts } = f.states[id];
+    if (accepts) useful.set(id, nid++);
+    for (const { target } of edges) {
+      const parents = back.get(target);
+      if (parents) parents.add(id);
+      else {
+        back.set(target, new Set([id]));
+        stack.push(target);
+      }
+    }
+  }
+
+  // Trace backwards to identify all useful states.
+  stack.push(...useful.keys());
+  while (stack.length > 0) {
+    const id = stack.pop() as number;
+    for (const parent of back.get(id) as Set<number>) {
+      if (useful.has(parent)) continue;
+      useful.set(parent, nid++);
+      stack.push(parent);
+    }
+  }
+
+  return useful;
+}
+
 export class FST {
   // https://www.aclweb.org/anthology/C88-2113.pdf
 
   private is_plus = false;
   private is_determined = false;
+  private is_total = false;
+  private is_pruned = false;
   constructor(public states: State[], public start = 0) {}
   
   clone() {
@@ -161,33 +289,24 @@ export class FST {
   }
   
   union(...gs: FST[]) {
+    if (gs.length === 0) return this;
     const f = this.clone();
-    const fstates = f.states;
-    for (const g of gs) {
-      const l = fstates.length;
-      const l1 = l - 1;
-      for (const s of g.states) {
-        if (s.n === g.start) {
-          // Combine starting states
-          const { edges } = f.states[f.start];
-          for (const e of s.edges) {
-            const target = e.target;
-            const ntarget = target == g.start ? f.start :
-                            target + (target < g.start ? l : l1);
-            edges.push(new Edge(e.input, e.output, f.start, ntarget));
-          }
-        } else {
-          // Append non-starting states, and fix up state indices
-          const n = f.states.length;
-          const edges = s.edges.map(e => {
-            const target = e.target;
-            const ntarget = target == g.start ? f.start :
-                            target + (target < g.start ? l : l1);
-            return new Edge(e.input, e.output, n, ntarget);
-          });
-          fstates.push(new State(n, s.accepts, edges));
-        }
-      }
+    mutate_union(f, ...gs);
+    return f;
+  }
+
+  intersect(...gs: FST[]) {
+    if (gs.length === 0) return this;
+    const cs = gs.map(g => g.complement());
+    let f = this.complement();
+    
+    mutate_union(f, ...cs);
+    f = f.determinize();
+    mutate_total(f);
+    f.is_total = true;
+
+    for (const s of f.states) {
+      s.accepts = !s.accepts;
     }
 
     return f;
@@ -214,6 +333,8 @@ export class FST {
   }
 
   compose(...gs: FST[]) {
+    if (gs.length === 0) return this;
+
     // https://storage.googleapis.com/pub-tools-public-publication-data/pdf/35539.pdf
     let f: FST = this;
     for (const g of gs) {
@@ -310,6 +431,8 @@ export class FST {
   }
 
   concat(...gs: FST[]) {
+    if (gs.length === 0) return this;
+
     const f = this.clone();
     const { states } = f;
     
@@ -546,7 +669,87 @@ export class FST {
     const fst = new FST(states, 0);
     fst.is_plus = this.is_plus;
     fst.is_determined = true;
-    return true;
+    return fst;
+  }
+
+  totalize() {
+    if (this.is_total) return this;
+    const f = this.clone();
+    mutate_total(f);
+    f.is_total = true; 
+
+    return f;
+  }
+
+  complement() {
+    let f: FST = this.is_determined ?
+      this.clone() : this.determinize();
+    f.is_determined = true;
+    
+    mutate_total(f);
+    f.is_total = true;
+    
+    for (const s of f.states) {
+      s.accepts = !s.accepts;
+    }
+
+    return f;
+  }
+  
+  prune() {
+    if (this.is_pruned) return this;
+
+    const useful = trace(this);
+
+    if (useful.size === 0) {
+      this.states.length = 1;
+      this.start = 0;
+      const s = this.states[0];
+      s.accepts = false;
+      s.edges.length = 0;
+      return this;
+    }
+
+    // Preserve only useful states.
+    const states: State[] = [];
+    for (const s of this.states) {
+      const id = useful.get(s.n);
+      if (id === void 0) continue;
+      s.n = id;
+      for (const e of s.edges) {
+        e.source = id;
+        e.target = useful.get(e.target) as number;
+      }
+      states[id] = s;
+    }
+    
+    this.states = states;
+    this.start = useful.get(this.start) as number;
+    this.is_pruned = true;
+    return this;
+  }
+
+  pruned() {
+    if (this.is_pruned) return this;
+
+    const useful = trace(this);
+
+    if (useful.size === 0)
+      return new FST([new State(0, false, [])], 0);
+
+    // Preserve only useful states.
+    const states: State[] = [];
+    for (const { n, edges, accepts } of this.states) {
+      const id = useful.get(n);
+      if (id === void 0) continue;
+      states[id] = new State(id, accepts, edges.map(e => 
+        new Edge(e.input, e.output, id, useful.get(e.target) as number)
+      ));
+    }
+    
+    const f = new FST(states, useful.get(this.start) as number);
+    f.is_pruned = true;
+    return f;
   }
 
   private execute(
@@ -579,9 +782,10 @@ export class FST {
     ).join('\n');
   }
 
-  static union(f: FST, ...gs: FST[]) { return f.union(...gs); }
-  static compose(f: FST, ...gs: FST[]){ return f.compose(...gs); }
-  static concat(f: FST, ...gs: FST[]){ return f.concat(...gs); }
+  static union(f: FST, g: FST, ...gs: FST[]) { return f.union(g, ...gs); }
+  static intersect(f: FST, g: FST, ...gs: FST[]) { return f.intersect(g, ...gs); }
+  static compose(f: FST, g: FST, ...gs: FST[]){ return f.compose(g, ...gs); }
+  static concat(f: FST, g: FST, ...gs: FST[]){ return f.concat(g, ...gs); }
 
   static from_pairs(pairs: Iterable<[Token, Token]>) {
     const states = [];
