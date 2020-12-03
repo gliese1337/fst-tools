@@ -160,30 +160,33 @@ export class FST {
     return new FST(nstates, this.start) as FST;
   }
   
-  union(g: FST) {
+  union(...gs: FST[]) {
     const f = this.clone();
-    const l = f.states.length;
-    const l1 = l - 1;
-    for (const s of g.states) {
-      if (s.n === g.start) {
-        // Combine starting states
-        const { edges } = f.states[f.start];
-        for (const e of s.edges) {
-          const target = e.target;
-          const ntarget = target == g.start ? f.start :
-                         target + (target < g.start ? l : l1);
-          edges.push(new Edge(e.input, e.output, f.start, ntarget));
+    const fstates = f.states;
+    for (const g of gs) {
+      const l = fstates.length;
+      const l1 = l - 1;
+      for (const s of g.states) {
+        if (s.n === g.start) {
+          // Combine starting states
+          const { edges } = f.states[f.start];
+          for (const e of s.edges) {
+            const target = e.target;
+            const ntarget = target == g.start ? f.start :
+                            target + (target < g.start ? l : l1);
+            edges.push(new Edge(e.input, e.output, f.start, ntarget));
+          }
+        } else {
+          // Append non-starting states, and fix up state indices
+          const n = f.states.length;
+          const edges = s.edges.map(e => {
+            const target = e.target;
+            const ntarget = target == g.start ? f.start :
+                            target + (target < g.start ? l : l1);
+            return new Edge(e.input, e.output, n, ntarget);
+          });
+          fstates.push(new State(n, s.accepts, edges));
         }
-      } else {
-        // Append non-starting states, and fix up state indices
-        const n = f.states.length;
-        const edges = s.edges.map(e => {
-          const target = e.target;
-          const ntarget = target == g.start ? f.start :
-                         target + (target < g.start ? l : l1);
-          return new Edge(e.input, e.output, n, ntarget);
-        });
-        f.states.push(new State(n, s.accepts, edges));
       }
     }
 
@@ -210,161 +213,173 @@ export class FST {
     return edges;
   }
 
-  compose(g: FST) {
+  compose(...gs: FST[]) {
     // https://storage.googleapis.com/pub-tools-public-publication-data/pdf/35539.pdf
-    const f = this;
-    const A = f.states.length;
-    const B = g.states.length;
+    let f: FST = this;
+    for (const g of gs) {
+      const A = f.states.length;
+      const B = g.states.length;
 
-    // Get all initial edges, augmented
-    // with epsilon self-loops at every node
-    const fes = f.all_edges_with_loops();
-    const ges = g.all_edges_with_loops();
+      // Get all initial edges, augmented
+      // with epsilon self-loops at every node
+      const fes = f.all_edges_with_loops();
+      const ges = g.all_edges_with_loops();
 
-    // Generate all possible matched transitions
-    // Source and target states are pairs of f's
-    // states and g's states.
-    const edges: Edge[] = [];
-    for (const fe of fes) {
-      for (const ge of ges) {
-        if (fe.output !== ge.input) continue;
-        const source = fe.source * (B + 1) + ge.source;
-        const target = fe.target * (B + 1) + ge.target;
-        edges.push(
-          new Edge(fe.input, ge.output, source, target)
-        );
-      }
-    }
-
-    // Create states that are accessible
-    // via the combined transitions, starting with
-    // the combined start state, and assign
-    // transitions to them.
-    // State numbers are compactified as we go,
-    // and we build a map from intermediate combined
-    // state numbers to compact state numbers.
-    const initial = f.start * (B + 1) + g.start;
-    const stateMap = new Map([[initial, 0]]);
-    const stack = [initial];
-    const visited = new Set([initial]);
-    const states: State[] = [];
-    while (stack.length > 0) {
-      // get the id of the state we need to create
-      const n = stack.pop() as number;
-      
-      // find all edges that exit that state
-      const arcs = edges.filter(e => e.source === n);
-      
-      // determine the new compactified state id,
-      // and store the relation for later re-writing.
-      const nn = states.length;
-      stateMap.set(n, nn);
-      
-      // create the new state
-      states.push(new State(nn, false, arcs));
-
-      // determine which states are reachable from this one
-      for (const { target } of arcs) {
-        // If we already created the target
-        // state, or plan to do so,
-        // don't do anything.
-        if (visited.has(target)) continue;
-
-        // Otherwise, plan to create the target state.
-        visited.add(target);
-        stack.push(target);
-      }
-    }
-
-    // Fix up used edges to have the correct
-    // compactified state numbers.
-    // We don't iterate over all generated edges
-    // because some of them may not be used.
-    for (const { n, edges } of states) {
-      for (const e of edges) {
-        e.source = n;
-        e.target = stateMap.get(e.target) as number;
-      }
-    }
-
-    // Calculate which new states should be accepting states
-    for (let i = 0, j = 0; j < A; j++) {
-      if (!f.states[j].accepts) i += B;
-      else for (let k = 0; k < B; k++, i++) {
-        if (g.states[k].accepts) {
-          const id = stateMap.get(j * (B + 1) + k);
-          if (id) states[id].accepts = true;
+      // Generate all possible matched transitions
+      // Source and target states are pairs of f's
+      // states and g's states.
+      const edges: Edge[] = [];
+      for (const fe of fes) {
+        for (const ge of ges) {
+          if (fe.output !== ge.input) continue;
+          const source = fe.source * (B + 1) + ge.source;
+          const target = fe.target * (B + 1) + ge.target;
+          edges.push(
+            new Edge(fe.input, ge.output, source, target)
+          );
         }
       }
-    }
 
-    // TODO: Minimize 
-    return new FST(states, 0);
-  }
-
-  concat(g: FST) {
-    const fst = this.clone();
-    const gstart = g.start;
-
-    // g's start state may end up stranded, if
-    // it is not recursively accessible in g.
-    // So, before copying it, check if we need to.
-    let stranded = false;
-    find_gstart: {
-      const { states } = g;
-      const stack = [gstart];
-      const seen = new Set();
+      // Create states that are accessible
+      // via the combined transitions, starting with
+      // the combined start state, and assign
+      // transitions to them.
+      // State numbers are compactified as we go,
+      // and we build a map from intermediate combined
+      // state numbers to compact state numbers.
+      const initial = f.start * (B + 1) + g.start;
+      const stateMap = new Map([[initial, 0]]);
+      const stack = [initial];
+      const visited = new Set([initial]);
+      const states: State[] = [];
       while (stack.length > 0) {
-        const { edges } = states[stack.pop() as number];
-        for (const { target } of edges) {
-          if (target === gstart) break find_gstart;
-          if (seen.has(target)) continue;
-          seen.add(target);
+        // get the id of the state we need to create
+        const n = stack.pop() as number;
+        
+        // find all edges that exit that state
+        const arcs = edges.filter(e => e.source === n);
+        
+        // determine the new compactified state id,
+        // and store the relation for later re-writing.
+        const nn = states.length;
+        stateMap.set(n, nn);
+        
+        // create the new state
+        states.push(new State(nn, false, arcs));
+
+        // determine which states are reachable from this one
+        for (const { target } of arcs) {
+          // If we already created the target
+          // state, or plan to do so,
+          // don't do anything.
+          if (visited.has(target)) continue;
+
+          // Otherwise, plan to create the target state.
+          visited.add(target);
           stack.push(target);
         }
       }
-      stranded = true;
+
+      // Fix up used edges to have the correct
+      // compactified state numbers.
+      // We don't iterate over all generated edges
+      // because some of them may not be used.
+      for (const { n, edges } of states) {
+        for (const e of edges) {
+          e.source = n;
+          e.target = stateMap.get(e.target) as number;
+        }
+      }
+
+      // Calculate which new states should be accepting states
+      for (let i = 0, j = 0; j < A; j++) {
+        if (!f.states[j].accepts) i += B;
+        else for (let k = 0; k < B; k++, i++) {
+          if (g.states[k].accepts) {
+            const id = stateMap.get(j * (B + 1) + k);
+            if (id) states[id].accepts = true;
+          }
+        }
+      }
+
+      f = new FST(states, 0);
     }
 
+    // TODO: Minimize 
+    return f;
+  }
+
+  concat(...gs: FST[]) {
+    const f = this.clone();
+    const { states } = f;
+    
     // Cache f's accepting states, because these
     // will be used to link to g's copied states.
-    const { states } = fst;
-    const accepting = states.filter(s => s.accepts);
+    const accepting = f.states.filter(s => s.accepts);
 
-    // Copy g's states into the new FST state list.
-    const offset = states.length;
-    for (const { n, accepts, edges } of g.states) {
-      if (stranded && n === gstart) continue;
-      const idx = n + offset - (stranded && n > gstart ? 1 : 0);
-      states.push(new State(
-        idx,
-        accepts,
-        edges.map(e =>
-          new Edge(
-            e.input, e.output, idx,
-            e.target + offset - (stranded && e.target > gstart ? 1 : 0),
-          )
-        ),
-      ));
-    }
+    for (const g of gs) {
+      const gstart = g.start;
 
-    // Add the starting transitions of g to the old
-    // accepting states of f. We preserve the start
-    // state of f and the accepting states of g.
-    const transitions = g.states[gstart].edges;
-    for (const state of accepting) {
-      state.accepts = false;
-      const { n, edges } = state;
-      for (const { input, output, target } of transitions) {
-        edges.push(new Edge(
-          input, output, n,
-          target + offset - (stranded && target > gstart ? 1 : 0),
-        ));
+      // g's start state may end up stranded, if
+      // it is not recursively accessible in g.
+      // So, before copying it, check if we need to.
+      let stranded = false;
+      find_gstart: {
+        const { states } = g;
+        const stack = [gstart];
+        const seen = new Set();
+        while (stack.length > 0) {
+          const { edges } = states[stack.pop() as number];
+          for (const { target } of edges) {
+            if (target === gstart) break find_gstart;
+            if (seen.has(target)) continue;
+            seen.add(target);
+            stack.push(target);
+          }
+        }
+        stranded = true;
+      }
+
+      const offset = states.length;
+
+      // Add the starting transitions of g to the old
+      // accepting states of f. We preserve the start
+      // state of f and the accepting states of g.
+      const transitions = g.states[gstart].edges;
+      for (const state of accepting) {
+        state.accepts = false;
+        const { n, edges } = state;
+        for (const { input, output, target } of transitions) {
+          edges.push(new Edge(
+            input, output, n,
+            target + offset - (stranded && target > gstart ? 1 : 0),
+          ));
+        }
+      }
+
+      // Copy g's states into the new FST state list,
+      // and kee track of which are accepting, in case
+      // we need to concatenate another FST.
+      accepting.length = 0;
+      for (const { n, accepts, edges } of g.states) {
+        if (stranded && n === gstart) continue;
+        const idx = n + offset - (stranded && n > gstart ? 1 : 0);
+        const s = new State(
+          idx, accepts,
+          edges.map(e =>
+            new Edge(
+              e.input, e.output, idx,
+              e.target + offset - (stranded && e.target > gstart ? 1 : 0),
+            )
+          ),
+        );
+        states.push(s);
+        if (accepts) accepting.push(s);
       }
     }
 
     // TODO: minimize
-    return fst;
+    return f;
   }
 
   // Produce a simplified FST whose input and output are equal.
@@ -564,9 +579,9 @@ export class FST {
     ).join('\n');
   }
 
-  static union(f: FST, g: FST) { return f.union(g); }
-  static compose(f: FST, g: FST){ return f.compose(g); }
-  static concat(f: FST, g: FST){ return f.concat(g); }
+  static union(f: FST, ...gs: FST[]) { return f.union(...gs); }
+  static compose(f: FST, ...gs: FST[]){ return f.compose(...gs); }
+  static concat(f: FST, ...gs: FST[]){ return f.concat(...gs); }
 
   static from_pairs(pairs: Iterable<[Token, Token]>) {
     const states = [];
