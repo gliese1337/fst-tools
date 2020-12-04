@@ -278,6 +278,7 @@ export class FST {
   private is_plus = false;
   private is_determined = false;
   private is_total = false;
+  private is_minimal = false;
   private is_pruned = false;
   constructor(public states: State[], public start = 0) {}
   
@@ -426,7 +427,6 @@ export class FST {
       f = new FST(states, 0);
     }
 
-    // TODO: Minimize 
     return f;
   }
 
@@ -501,7 +501,6 @@ export class FST {
       }
     }
 
-    // TODO: minimize
     return f;
   }
 
@@ -519,7 +518,6 @@ export class FST {
       return new State(s.n, s.accepts, edges);
     });
 
-    // TODO: Minimize
     return new FST(nstates, this.start);  
   }
 
@@ -561,8 +559,7 @@ export class FST {
         edges.push(new Edge(input, output, n, target));
       }
     }
-    
-    // TODO: Minimize
+
     fst.is_plus = true;
     return fst;
   }
@@ -676,7 +673,8 @@ export class FST {
     if (this.is_total) return this;
     const f = this.clone();
     mutate_total(f);
-    f.is_total = true; 
+    f.is_total = true;
+    f.is_plus = this.is_plus;
 
     return f;
   }
@@ -709,6 +707,11 @@ export class FST {
       s.edges.length = 0;
       return this;
     }
+    
+    if (useful.size === this.states.length) {
+      this.is_pruned = true;
+      return this;
+    }
 
     // Preserve only useful states.
     const states: State[] = [];
@@ -737,6 +740,11 @@ export class FST {
     if (useful.size === 0)
       return new FST([new State(0, false, [])], 0);
 
+    if (useful.size === this.states.length) {
+      this.is_pruned = true;
+      return this;
+    }
+
     // Preserve only useful states.
     const states: State[] = [];
     for (const { n, edges, accepts } of this.states) {
@@ -749,7 +757,129 @@ export class FST {
     
     const f = new FST(states, useful.get(this.start) as number);
     f.is_pruned = true;
+    f.is_plus = this.is_plus;
+    f.is_determined = this.is_determined;
     return f;
+  }
+
+  minimize() {
+    if (this.is_minimal) return this;
+
+    // http://www.cs.um.edu.mt/gordon.pace/Research/Software/Relic/Transformations/FSA/minimise.html
+
+    // The automaton must first be deterministic, total, and
+    // have unreachable and useless states removed (except
+    // for at most one useless state needed for totality.)
+    const f = this.is_determined ?
+      this.pruned() : this.determinize().prune();
+    mutate_total(f);
+
+    // Construct an nxn matrix D(0) such that the
+    // entry D(0)i,j is i_accepts XOR j_accepts.
+    const { states } = f;
+    const l = states.length;
+    let D0: boolean[][] = [];
+    let D1: boolean[][] = [];
+    for (let i = 0; i < l; i++) {
+      const row: boolean[] = [];
+      D0.push(row);
+      D1.push(new Array(l));
+      const sia = states[i].accepts;
+      for (let j = 0; j < l; j++) {
+        row.push(sia !== states[j].accepts);
+      }
+    }
+
+    // Given matrix D(k) we can construct matrix D(k+1) as follows:
+    //  D(k+1)i,j is TRUE if
+    //    1. D(k)i,j was TRUE or
+    //    2. there is an input a such that starting from
+    //        states i and j with input a takes us to states i', j`
+    //        such that D(k)i',j' is TRUE.
+    let changed: boolean;
+    let count = 0;
+    do {
+      changed = false;
+      for (let i = 0; i < l; i++) {
+        const row0 = D0[i];
+        const row1 = D1[i];
+        const i_edges = states[i].edges;
+        row: for (let j = 0; j < l; j++) {
+          if (row0[j]) row1[j] = true;
+          else {
+            const j_edges = states[j].edges;
+            for (const { input: ii, output: io, target: it } of i_edges) {
+              for (const { input: ji, output: jo, target: jt } of j_edges) {
+                if (ii !== ji || io !== jo) continue;
+                if (D0[it][jt]) {
+                  changed = true;
+                  row1[j] = true;
+                  continue row;
+                }
+              }
+            }
+            row1[j] = false;
+          }
+        }
+      }
+      count++;
+      [D0, D1] = [D1, D0];
+    } while (changed);
+
+    if (count === 1) {
+      // Nothing changed on the first, and only, iteration.
+      f.is_minimal = true;
+      return f;
+    }
+
+    // We now know that state i is indistinguishable from state j
+    // iff Di,j is FALSE; give each state a number corresponding
+    // to its equivalence class so we can construct the new states.
+    const state_classes = new Array<number|undefined>(l);
+    let n = 0;
+    for (let i = 0; i < l; i++) {
+      const set = state_classes[i] ?? n++;
+      state_classes[i] = set;
+      const row = D0[i];
+      for (let j = 0; j < l; j++) {
+        if (row[j]) continue;
+        state_classes[j] = set;
+      }
+    }
+
+    if (n === l) {
+      // Every state is already distinguishable
+      f.is_minimal = true;
+      return f;
+    }
+
+    // Construct the new combined states, merging
+    // transitions and re-indexing as we go.
+    const nstates: State[] = Array.from({ length: n }, (_, i) => new State(i, false, []));
+    for (let i = 0; i < l; i++) {
+      const id = state_classes[i] as number;
+      const ostate = states[i];
+      const nstate = nstates[id];
+      
+      if (ostate.accepts) nstate.accepts = true;
+
+      const { edges } = nstate;
+      for (const { input, output, target } of ostate.edges) {
+        const ntarget = state_classes[target] as number;
+        if (edges.findIndex(e =>
+          e.target === ntarget &&
+          e.input === input &&
+          e.output === output
+        )) continue;
+        edges.push(new Edge(input, output, id, ntarget));
+      }
+    }
+    
+    const fst = new FST(nstates, state_classes[f.start]);
+    fst.is_determined = true;
+    fst.is_minimal = true;
+    fst.is_plus = f.is_plus;
+    return fst.prune();
   }
 
   private execute(
