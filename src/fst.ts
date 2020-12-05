@@ -601,7 +601,9 @@ export class FST {
       .join(' ');
 
     const states: State[] = [];
-    const init_set = new Set(double_epsilon_closure(this.states[this.start], this));
+    const init_set = new Set(
+      double_epsilon_closure(this.states[this.start], this)
+    );
 
     const seen_sets = new Map([[hash(init_set), 0]]);
     const stack: [Set<State>, number][] = [[init_set, 0]];
@@ -778,12 +780,10 @@ export class FST {
     // entry D(0)i,j is i_accepts XOR j_accepts.
     const { states } = f;
     const l = states.length;
-    let D0: boolean[][] = [];
-    let D1: boolean[][] = [];
+    const D: boolean[][] = [];
     for (let i = 0; i < l; i++) {
       const row: boolean[] = [];
-      D0.push(row);
-      D1.push(new Array(l));
+      D.push(row);
       const sia = states[i].accepts;
       for (let j = 0; j < l; j++) {
         row.push(sia !== states[j].accepts);
@@ -801,29 +801,25 @@ export class FST {
     do {
       changed = false;
       for (let i = 0; i < l; i++) {
-        const row0 = D0[i];
-        const row1 = D1[i];
+        const row = D[i];
         const i_edges = states[i].edges;
         row: for (let j = 0; j < l; j++) {
-          if (row0[j]) row1[j] = true;
-          else {
-            const j_edges = states[j].edges;
-            for (const { input: ii, output: io, target: it } of i_edges) {
-              for (const { input: ji, output: jo, target: jt } of j_edges) {
-                if (ii !== ji || io !== jo) continue;
-                if (D0[it][jt]) {
-                  changed = true;
-                  row1[j] = true;
-                  continue row;
-                }
+          if (row[j]) continue;
+        
+          const j_edges = states[j].edges;
+          for (const { input: ii, output: io, target: it } of i_edges) {
+            for (const { input: ji, output: jo, target: jt } of j_edges) {
+              if (ii !== ji || io !== jo) continue;
+              if (D[it][jt]) {
+                changed = true;
+                row[j] = true;
+                continue row;
               }
             }
-            row1[j] = false;
           }
         }
       }
       count++;
-      [D0, D1] = [D1, D0];
     } while (changed);
 
     if (count === 1) {
@@ -840,7 +836,7 @@ export class FST {
     for (let i = 0; i < l; i++) {
       const set = state_classes[i] ?? n++;
       state_classes[i] = set;
-      const row = D0[i];
+      const row = D[i];
       for (let j = 0; j < l; j++) {
         if (row[j]) continue;
         state_classes[j] = set;
@@ -855,7 +851,9 @@ export class FST {
 
     // Construct the new combined states, merging
     // transitions and re-indexing as we go.
-    const nstates: State[] = Array.from({ length: n }, (_, i) => new State(i, false, []));
+    const nstates: State[] = Array.from({ length: n },
+      (_, i) => new State(i, false, [])
+    );
     for (let i = 0; i < l; i++) {
       const id = state_classes[i] as number;
       const ostate = states[i];
